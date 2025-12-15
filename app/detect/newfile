@@ -1,0 +1,455 @@
+"use client";
+
+// use when the API key is down , when token exhausted
+
+import type React from "react";
+import { useState, useEffect } from "react";
+import { Navbar } from "@/components/navbar";
+import { Footer } from "@/components/footer";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import {
+  Upload,
+  Loader2,
+  CheckCircle2,
+  AlertCircle,
+  Eye,
+  RefreshCw,
+  Shield,
+  Brain,
+} from "lucide-react";
+import Image from "next/image";
+import { createClient } from "@/lib/supabase/client";
+import { useAuth } from "@/lib/auth-context";
+import { useRouter } from "next/navigation";
+
+interface PredictionResult {
+  disease: string;
+  confidence: number;
+  models_used?: string[];
+}
+
+interface ValidationResult {
+  isRetinal: boolean;
+  confidence: number;
+  reason: string;
+  suggestions?: string;
+  modelUsed?: string;
+}
+
+export default function DetectPage() {
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [validating, setValidating] = useState(false);
+  const [validationResult, setValidationResult] = useState<ValidationResult | null>(null);
+  const [result, setResult] = useState<PredictionResult | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  // New: when true we skip OpenAI validation and call disease prediction directly
+  const [validationDisabled, setValidationDisabled] = useState<boolean>(false);
+
+  const { isAuthenticated, user, loading: authLoading } = useAuth();
+  const router = useRouter();
+  const supabase = createClient();
+
+  // ---------------------------
+  // Image downscaling helper
+  // ---------------------------
+  async function downscaleImage(file: File, maxSize = 512): Promise<File> {
+    const img = document.createElement("img");
+    img.src = URL.createObjectURL(file);
+    await new Promise((r) => (img.onload = r));
+
+    const canvas = document.createElement("canvas");
+    const scale = Math.min(maxSize / img.width, maxSize / img.height);
+    canvas.width = Math.max(1, Math.round(img.width * scale));
+    canvas.height = Math.max(1, Math.round(img.height * scale));
+    const ctx = canvas.getContext("2d")!;
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+    const blob = await new Promise<Blob | null>((r) =>
+      canvas.toBlob((b) => r(b), file.type || "image/jpeg", 0.85)
+    );
+
+    if (!blob) {
+      // fallback: return original file if canvas failed
+      return file;
+    }
+    return new File([blob], file.name, { type: file.type || "image/jpeg" });
+  }
+
+  // ---------------------------
+  // Auth redirect
+  // ---------------------------
+  useEffect(() => {
+    if (authLoading) return;
+    if (!isAuthenticated) {
+      const timer = setTimeout(() => {
+        router.push("/login");
+      }, 100);
+      return () => clearTimeout(timer);
+    }
+  }, [isAuthenticated, authLoading, router]);
+
+  if (authLoading) {
+    return (
+      <div className="min-h-screen flex flex-col">
+        <Navbar />
+        <div className="flex-1 flex items-center justify-center">
+          <Loader2 className="h-8 w-8 animate-spin mx-auto" />
+          <p className="text-muted-foreground mt-2">Checking authentication...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (!isAuthenticated) {
+    return (
+      <div className="min-h-screen flex flex-col">
+        <Navbar />
+        <div className="flex-1 flex items-center justify-center">
+          <Loader2 className="h-8 w-8 animate-spin mx-auto" />
+          <p className="text-muted-foreground mt-2">Redirecting to login...</p>
+        </div>
+      </div>
+    );
+  }
+
+  // ---------------------------
+  // File select handler (downscale + validate)
+  // ---------------------------
+  const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    // basic checks
+    if (!file.type.startsWith("image/")) {
+      setError("Please select a valid image file (JPG, PNG)");
+      return;
+    }
+
+    if (file.size > 10 * 1024 * 1024) {
+      // a bit more permissive client-side; we'll downscale anyway
+      setError("Image too large. Please select an image smaller than 10MB.");
+      return;
+    }
+
+    // Downscale the image to avoid large uploads / token issues
+    const resizedFile = await downscaleImage(file, 512);
+
+    setSelectedFile(resizedFile);
+    setPreviewUrl(URL.createObjectURL(resizedFile));
+    setError(null);
+    setValidationResult(null);
+    setResult(null);
+
+    // If validation is disabled globally, skip calling validation API.
+    if (validationDisabled) {
+      // Inform user we are skipping validation (already set earlier)
+      return;
+    }
+
+    // Try validation
+    await validateImage(resizedFile);
+  };
+
+  // ---------------------------
+  // Validate with OpenAI (server route)
+  // If validation fails due to quota/auth errors we enable fallback.
+  // ---------------------------
+  const validateImage = async (file: File) => {
+    setValidating(true);
+    setError(null);
+
+    try {
+      const formData = new FormData();
+      formData.append("image", file);
+
+      const resp = await fetch("/api/validate-retina", {
+        method: "POST",
+        body: formData,
+      });
+
+      // read JSON (may be error payload)
+      const data = await resp.json().catch(() => null);
+
+      if (!resp.ok) {
+        // If the server returned a 429 / quota / authentication error, enable fallback
+        const status = resp.status;
+        const text = (data && (data.error || JSON.stringify(data))) || resp.statusText;
+
+        // check for known patterns that indicate quota/auth issues
+        const lower = String(text).toLowerCase();
+        const isQuotaOrAuth =
+          status === 429 ||
+          lower.includes("quota") ||
+          lower.includes("exceed") ||
+          lower.includes("rate limit") ||
+          lower.includes("unauthenticated") ||
+          lower.includes("request too large") ||
+          lower.includes("token");
+
+        if (isQuotaOrAuth) {
+          // Enable fallback to direct disease prediction
+          setValidationDisabled(true);
+          setError(
+            "Image validation service unavailable (quota/limits). Proceeding without retinal verification."
+          );
+          console.warn("Validation disabled due to:", status, text);
+          return;
+        }
+
+        // other validation errors: show message
+        throw new Error(data?.error || text || "Validation failed");
+      }
+
+      // if response ok, set result
+      setValidationResult(data as ValidationResult);
+
+      // if model indicates non-retinal, show error and block analysis
+      if (!data?.isRetinal) {
+        setError(`This image may not be a retinal image. ${data.reason ?? ""}`);
+      }
+    } catch (err: any) {
+      // Network or parsing error: if message suggests quota, switch to fallback
+      const msg = String(err?.message || err).toLowerCase();
+      const isQuotaOrAuth =
+        msg.includes("quota") ||
+        msg.includes("exceed") ||
+        msg.includes("rate limit") ||
+        msg.includes("unauthenticated") ||
+        msg.includes("request too large") ||
+        msg.includes("token");
+
+      if (isQuotaOrAuth) {
+        setValidationDisabled(true);
+        setError(
+          "Image validation service unavailable (quota/limits). Proceeding without retinal verification."
+        );
+        console.warn("Validation disabled due to caught error:", err);
+      } else {
+        setError(err?.message || "Failed to validate image.");
+      }
+    } finally {
+      setValidating(false);
+    }
+  };
+
+  // ---------------------------
+  // Submit to disease prediction API.
+  // If validationDisabled === true we bypass validation and directly send the image.
+  // ---------------------------
+  const handleSubmit = async () => {
+    if (!selectedFile) {
+      setError("Please select an image first.");
+      return;
+    }
+
+    // If validation result exists and is non-retinal, block unless validation disabled.
+    if (!validationDisabled && validationResult && !validationResult.isRetinal) {
+      setError("Please upload a valid retinal image for analysis.");
+      return;
+    }
+
+    setLoading(true);
+    setError(null);
+
+    try {
+      const formData = new FormData();
+      formData.append("image", selectedFile);
+
+      // Direct disease detection API (your existing endpoint)
+      const res = await fetch(
+        "https://pravinpatil007-eye-disease-detection-api-new.hf.space/api/predict_simple",
+        { method: "POST", body: formData }
+      );
+
+      if (!res.ok) {
+        const txt = await res.text().catch(() => null);
+        throw new Error(txt || "Failed to get prediction from API");
+      }
+
+      const data = await res.json();
+      setResult(data as PredictionResult);
+
+      // Save to Supabase if logged in
+      if (user && previewUrl) {
+        await supabase.from("detection_history").insert({
+          user_id: user.id,
+          image_url: previewUrl,
+          detected_condition: data.disease,
+          confidence: data.confidence,
+          models_used: data.models_used || [],
+        });
+      }
+    } catch (err: any) {
+      console.error("Prediction error:", err);
+      setError("Failed to analyze image. Please try again.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const canAnalyze = (validationDisabled || validationResult?.isRetinal) && !validating;
+
+  // colors
+  const getDiseaseColor = (d: string) => {
+    const l = d.toLowerCase();
+    if (l.includes("normal")) return "text-green-500";
+    if (l.includes("glaucoma")) return "text-red-500";
+    if (l.includes("cataract")) return "text-blue-500";
+    if (l.includes("retinopathy")) return "text-orange-500";
+    return "text-primary";
+  };
+
+  return (
+    <div className="min-h-screen flex flex-col">
+      <Navbar />
+      <main className="flex-1 py-12 px-4">
+        <div className="container max-w-4xl mx-auto space-y-8">
+          {/* Header */}
+          <div className="text-center space-y-4">
+            <div className="flex justify-center">
+              <div className="p-4 rounded-full bg-primary/10">
+                <Eye className="h-10 w-10 text-primary" />
+              </div>
+            </div>
+            <h1 className="text-4xl md:text-5xl font-bold">OcuNova</h1>
+            <p className="text-lg text-muted-foreground max-w-2xl mx-auto">
+              Upload a retinal fundus image and get AI-powered disease analysis.
+            </p>
+            <p className="text-sm text-green-600">✅ Welcome, {user?.email}</p>
+          </div>
+
+          {/* Upload/Card */}
+          <Card className="border-2">
+            <CardHeader>
+              <CardTitle>Upload Retinal Image</CardTitle>
+              <CardDescription>Select a clear retinal fundus image (JPG or PNG)</CardDescription>
+            </CardHeader>
+
+            <CardContent className="space-y-6">
+              <div className="flex flex-col items-center justify-center border-2 border-dashed rounded-lg p-8">
+                <input
+                  type="file"
+                  id="file-upload"
+                  accept="image/*"
+                  onChange={handleFileSelect}
+                  className="hidden"
+                />
+                <label
+                  htmlFor="file-upload"
+                  className="flex flex-col items-center cursor-pointer text-center space-y-4"
+                >
+                  <Upload className="h-12 w-12 text-muted-foreground" />
+                  <div>
+                    <p className="text-sm font-medium">Click to upload or drag and drop</p>
+                    <p className="text-xs text-muted-foreground mt-1">PNG, JPG up to 10MB</p>
+                    <p className="text-xs text-blue-600 mt-2">
+                      ✓ AI-powered retinal verification (OpenAI) — will auto-fallback on quota
+                    </p>
+                  </div>
+                </label>
+              </div>
+
+              {/* Validation alert or fallback notice */}
+              {validating && (
+                <Alert className="bg-blue-50 border-blue-200">
+                  <Loader2 className="h-4 w-4 text-blue-600 animate-spin" />
+                  <AlertDescription className="flex items-center gap-2">
+                    <Brain className="h-4 w-4" /> Validating image with OpenAI Vision...
+                  </AlertDescription>
+                </Alert>
+              )}
+
+              {validationDisabled && (
+                <Alert className="bg-yellow-50 border-yellow-200">
+                  <AlertDescription>
+                    <strong>Validation currently unavailable.</strong> The app will proceed with
+                    disease prediction without retinal verification. (This happens when the validation
+                    service hits quota / is unauthenticated / rate-limited.)
+                  </AlertDescription>
+                </Alert>
+              )}
+
+              {validationResult && (
+                <Alert variant={validationResult.isRetinal ? "default" : "destructive"}>
+                  {validationResult.isRetinal ? (
+                    <CheckCircle2 className="h-4 w-4 text-green-600" />
+                  ) : (
+                    <AlertCircle className="h-4 w-4" />
+                  )}
+                  <AlertDescription>
+                    <strong>
+                      {validationResult.isRetinal ? "✅ Valid Retinal Image" : "❌ Not a Retinal Image"}
+                    </strong>
+                    <br />
+                    {validationResult.reason}
+                    <br />
+                    <span className="text-xs opacity-75">
+                      Confidence: {(validationResult.confidence * 100).toFixed(1)}%
+                    </span>
+                  </AlertDescription>
+                </Alert>
+              )}
+
+              {error && (
+                <Alert variant="destructive">
+                  <AlertCircle className="h-4 w-4" />
+                  <AlertDescription>{error}</AlertDescription>
+                </Alert>
+              )}
+
+              {previewUrl && (
+                <div className="space-y-4">
+                  <div className="relative w-full aspect-video rounded-lg overflow-hidden bg-muted">
+                    <Image src={previewUrl} alt="Preview" fill className="object-contain" />
+                  </div>
+
+                  <div className="flex gap-3">
+                    <Button onClick={handleSubmit} disabled={loading || !canAnalyze} className="flex-1">
+                      {loading ? (
+                        <>
+                          <Loader2 className="mr-2 h-4 w-4 animate-spin" /> Analyzing...
+                        </>
+                      ) : (
+                        <>
+                          <Shield className="mr-2 h-4 w-4" /> Analyze Retinal Image
+                        </>
+                      )}
+                    </Button>
+
+                    <Button variant="outline" onClick={() => window.location.reload()}>
+                      <RefreshCw className="mr-2 h-4 w-4" /> Reset
+                    </Button>
+                  </div>
+                </div>
+              )}
+
+              {result && (
+                <div className="mt-6 text-center space-y-2">
+                  <h3 className={`text-2xl font-bold ${getDiseaseColor(result.disease)}`}>
+                    {result.disease}
+                  </h3>
+                  <p className="text-sm text-muted-foreground">
+                    Confidence: {(result.confidence * 100).toFixed(1)}%
+                  </p>
+                </div>
+              )}
+            </CardContent>
+          </Card>
+        </div>
+      </main>
+
+      <Footer />
+    </div>
+  );
+}
